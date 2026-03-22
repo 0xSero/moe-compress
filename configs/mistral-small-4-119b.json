@@ -1,0 +1,131 @@
+{
+  "name": "mistral_small_4_119b_reap",
+  "output_root": "/mnt/llm_models/moe-compress-runs",
+  "parameters": {
+    "model_label": "Mistral-Small-4-119B-2603",
+    "base_model": "mistralai/Mistral-Small-4-119B-2603",
+    "model_path": "/mnt/llm_models/Mistral-Small-4-119B-2603",
+    "architecture": "MistralForCausalLM",
+    "local_dataset_path": "/home/ser/training-data/datasets/QUANTIZATION/calibration/calibration_best_20260111_065001/calibration_filtered.jsonl",
+    "local_dataset_input_rows_hint": "6122",
+    "quant_method": "AutoRound",
+    "quant_scheme": "W4A16",
+    "quant_device": "cpu",
+    "quant_device_map": "cpu",
+    "quant_seqlen": "512",
+    "quant_nsamples": "128",
+    "quant_batch_size": "1",
+    "quant_iters": "100",
+    "prune_percents": "10,25,40",
+    "cuda_devices": "1,3,4,5,6,7"
+  },
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "1,3,4,5,6,7"
+  },
+  "stages": [
+    {
+      "name": "build_calibration_bundle",
+      "type": "build_calibration_bundle",
+      "inline_config": {
+        "name": "mistral_small_4_calibration_v1",
+        "seed": 42,
+        "local_dataset": {
+          "path": "{local_dataset_path}",
+          "input_rows_hint": "{local_dataset_input_rows_hint}",
+          "text_fields": [
+            "prompt_text",
+            "text",
+            "content"
+          ],
+          "id_field": "prompt_id"
+        },
+        "lanes": [
+          {
+            "name": "long_context",
+            "description": "Longest local trajectories for long-context observation coverage.",
+            "sources": [
+              {
+                "type": "local",
+                "label": "local_long",
+                "selection": "longest",
+                "max_rows": 50,
+                "max_total_tokens": 819200,
+                "max_tokens_per_row": 16384
+              }
+            ]
+          },
+          {
+            "name": "short_mix",
+            "description": "Short local prompts plus public code and tool-use coverage.",
+            "sources": [
+              {
+                "type": "local",
+                "label": "local_short",
+                "selection": "shortest",
+                "max_rows": 400,
+                "max_total_tokens": 409600,
+                "max_tokens_per_row": 1024
+              },
+              {
+                "type": "huggingface",
+                "label": "evol_codealpaca",
+                "dataset": "theblackcat102/evol-codealpaca-v1",
+                "rows": 100,
+                "selection": "random"
+              },
+              {
+                "type": "huggingface",
+                "label": "xlam_function_calling",
+                "dataset": "Salesforce/xlam-function-calling-60k",
+                "rows": 100,
+                "selection": "random"
+              },
+              {
+                "type": "huggingface",
+                "label": "swe_smith_trajectories",
+                "dataset": "SWE-bench/SWE-smith-trajectories",
+                "split": "tool",
+                "rows": 100,
+                "selection": "random"
+              },
+              {
+                "type": "huggingface",
+                "label": "mixture_of_thoughts_code",
+                "dataset": "open-r1/Mixture-of-Thoughts",
+                "config": "code",
+                "rows": 100,
+                "selection": "random"
+              },
+              {
+                "type": "huggingface",
+                "label": "mixture_of_thoughts_math",
+                "dataset": "open-r1/Mixture-of-Thoughts",
+                "config": "math",
+                "rows": 100,
+                "selection": "random"
+              },
+              {
+                "type": "huggingface",
+                "label": "mixture_of_thoughts_science",
+                "dataset": "open-r1/Mixture-of-Thoughts",
+                "config": "science",
+                "rows": 100,
+                "selection": "random"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "quantization",
+      "type": "command",
+      "cmd": [
+        "python3",
+        "-c",
+        "import os, shutil, time, json\nfrom pathlib import Path\nfrom datetime import datetime\nfrom auto_round import AutoRound\n\ninput_dir = '{model_path}'\noutput_dir = '{model_path}-W4A16-AutoRound'\ncalib = '{stage_build_calibration_bundle_merged_output_jsonl}'\ntmp_out = output_dir + '.tmp'\n\nprint(f'Input: {input_dir}')\nprint(f'Output: {output_dir}')\nprint(f'Calibration: {calib}')\n\nif Path(output_dir).exists() and (Path(output_dir) / '.DONE').exists():\n    print('SKIP: Already completed'); exit(0)\n\nif Path(tmp_out).exists(): shutil.rmtree(tmp_out)\nPath(tmp_out).mkdir(parents=True, exist_ok=True)\n\nt0 = time.time()\nar = AutoRound(\n    input_dir,\n    scheme='W4A16',\n    dataset=f'{calib}:text',\n    device='cpu',\n    device_map='cpu',\n    trust_remote_code=True,\n    batch_size=1,\n    seqlen=512,\n    nsamples=128,\n    iters=100,\n    seed=42,\n)\nar.quantize_and_save(tmp_out, format='auto_round')\nelapsed = time.time() - t0\n\nfor name in ['config.json','chat_template.jinja','generation_config.json','tokenizer.json','tokenizer.model','tokenizer_config.json','special_tokens_map.json','added_tokens.json']:\n    src = Path(input_dir) / name\n    dst = Path(tmp_out) / name\n    if src.exists() and not dst.exists(): shutil.copy2(src, dst)\n\nif Path(output_dir).exists(): shutil.rmtree(output_dir)\nPath(tmp_out).rename(output_dir)\n\nPath(output_dir, '.DONE').write_text(json.dumps({'stage': 'autoround_w4a16', 'model': 'Mistral-Small-4-119B-2603', 'elapsed_hours': elapsed/3600, 'completed_at': datetime.now().isoformat()}, indent=2))\nprint(f'DONE in {elapsed/3600:.2f}h: {output_dir}')\n"
+      ],
+      "cwd": "/mnt/llm_models"
+    }
+  ]
+}
