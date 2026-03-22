@@ -157,10 +157,14 @@ def select_local_rows(
     max_total_tokens: int | None,
     max_tokens_per_row: int | None,
     seed: int,
+    **kwargs: Any,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    min_tokens_per_row = kwargs.get("min_tokens_per_row")
     filtered = list(rows)
     if max_tokens_per_row is not None:
         filtered = [row for row in filtered if row["estimated_tokens"] <= max_tokens_per_row]
+    if min_tokens_per_row is not None:
+        filtered = [row for row in filtered if row["estimated_tokens"] >= min_tokens_per_row]
 
     if selection == "longest":
         filtered.sort(key=lambda row: (-row["estimated_tokens"], row["row_id"]))
@@ -245,12 +249,22 @@ def load_hf_dataset_rows(source_cfg: dict[str, Any], lane_name: str, seed: int) 
     else:
         dataset = load_dataset(dataset_name, split=split)
 
+    min_tokens_per_row = source_cfg.get("min_tokens_per_row")
+
     indices = list(range(len(dataset)))
     if selection == "random":
         rng = random.Random(seed)
         rng.shuffle(indices)
     elif selection == "first":
         pass
+    elif selection == "longest":
+        # Pre-scan to sort by text length descending
+        lengths = []
+        for i in indices:
+            text = row_to_text(dataset_name, dataset_config, dataset[i], text_fields).strip()
+            lengths.append((i, len(text)))
+        lengths.sort(key=lambda x: -x[1])
+        indices = [i for i, _ in lengths]
     else:
         raise ValueError(f"Unsupported public selection {selection!r}")
 
@@ -266,6 +280,8 @@ def load_hf_dataset_rows(source_cfg: dict[str, Any], lane_name: str, seed: int) 
             continue
         estimated_tokens = estimate_tokens(text)
         if max_tokens_per_row is not None and estimated_tokens > max_tokens_per_row:
+            continue
+        if min_tokens_per_row is not None and estimated_tokens < min_tokens_per_row:
             continue
         built_rows.append(
             BuiltRow(
@@ -440,6 +456,7 @@ def build_bundle(config: dict[str, Any], output_dir: Path, dry_run: bool, config
                         max_rows=source_cfg.get("max_rows"),
                         max_total_tokens=source_cfg.get("max_total_tokens"),
                         max_tokens_per_row=source_cfg.get("max_tokens_per_row"),
+                        min_tokens_per_row=source_cfg.get("min_tokens_per_row"),
                         seed=source_seed,
                     )
                     source_summary = {
@@ -482,6 +499,58 @@ def build_bundle(config: dict[str, Any], output_dir: Path, dry_run: bool, config
                         }
                     )
                     lane_rows.extend([row.to_json() for row in built_rows])
+            elif source_kind == "external":
+                ext_path = Path(source_cfg["path"])
+                if not ext_path.is_absolute():
+                    ext_path = (config_dir / ext_path).resolve()
+                rows_requested = int(source_cfg.get("rows") or 0)
+                label = source_cfg.get("label", ext_path.stem)
+                text_field = source_cfg.get("text_field", "text")
+                if dry_run:
+                    source_summary = {
+                        "source_kind": "external_jsonl",
+                        "source": label,
+                        "selection": "all",
+                        "rows_requested": rows_requested,
+                        "rows_built": rows_requested,
+                        "estimated_tokens": 0,
+                    }
+                else:
+                    ext_rows: list[dict[str, Any]] = []
+                    with ext_path.open("r", encoding="utf-8") as handle:
+                        for line_no, line in enumerate(handle, start=1):
+                            raw = line.strip()
+                            if not raw:
+                                continue
+                            payload = json.loads(raw)
+                            text = str(payload.get(text_field, "")).strip()
+                            if not text:
+                                continue
+                            et = estimate_tokens(text)
+                            built = BuiltRow(
+                                row_id=f"{label}-{line_no}",
+                                text=text,
+                                estimated_tokens=et,
+                                lane=lane_name,
+                                source_kind="external_jsonl",
+                                source_dataset=str(ext_path),
+                                source_config=None,
+                                source_label=label,
+                                extra={},
+                            )
+                            ext_rows.append(built.to_json())
+                            if rows_requested and len(ext_rows) >= rows_requested:
+                                break
+                    total_ext_tokens = sum(r["estimated_tokens"] for r in ext_rows)
+                    source_summary = {
+                        "source_kind": "external_jsonl",
+                        "source": label,
+                        "selection": "all",
+                        "rows_requested": rows_requested or len(ext_rows),
+                        "rows_built": len(ext_rows),
+                        "estimated_tokens": total_ext_tokens,
+                    }
+                    lane_rows.extend(ext_rows)
             else:
                 raise ValueError(f"Unsupported source type {source_kind!r}")
 
